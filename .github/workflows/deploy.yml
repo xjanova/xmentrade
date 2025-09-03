@@ -5,25 +5,41 @@ on:
     branches: [ "main" ]
   workflow_dispatch: {}
 
+env:
+  SSH_HOST: ${{ secrets.SSH_HOST }}
+  SSH_USER: ${{ secrets.SSH_USER }}
+  SSH_PORT: ${{ secrets.SSH_PORT }}
+  DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+  PHP_BIN: /usr/local/php83/bin/php
+  DEFAULT_COMPOSER_BIN: /usr/local/bin/composer
+
 jobs:
   test-ssh-and-laravel:
     runs-on: ubuntu-latest
     steps:
-      - name: Test SSH connection & Laravel
-        uses: appleboy/ssh-action@v1.2.0
+      - name: Add SSH key to agent
+        uses: webfactory/ssh-agent@v0.8.0
         with:
-          host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USER }}
-          port: ${{ secrets.SSH_PORT }}
-          key: ${{ secrets.SSH_KEY }}
-          script: |
-            echo "✅ Connected to $(hostname)"
-            whoami
-            pwd
-            /usr/local/php83/bin/php -v
-            cd "${{ secrets.DEPLOY_PATH }}"
-            /usr/local/php83/bin/php artisan --version
-            /usr/local/php83/bin/php artisan about | grep "Laravel Framework" || true
+          ssh-private-key: ${{ secrets.SSH_KEY }}
+
+      - name: Trust host key
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -p "$SSH_PORT" "$SSH_HOST" >> ~/.ssh/known_hosts
+
+      - name: Test SSH & Laravel (pure OpenSSH)
+        shell: bash
+        run: |
+          set -e
+          echo ">> Try SSH to $SSH_USER@$SSH_HOST:$SSH_PORT"
+          ssh -vv -p "$SSH_PORT" -o StrictHostKeyChecking=no "$SSH_USER@$SSH_HOST" "\
+            echo '✅ Connected to' \$(hostname); \
+            whoami; \
+            $PHP_BIN -v; \
+            cd '$DEPLOY_PATH'; \
+            $PHP_BIN artisan --version; \
+            $PHP_BIN artisan about | grep 'Laravel Framework' || true \
+          "
 
   build-and-deploy:
     runs-on: ubuntu-latest
@@ -32,7 +48,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup PHP 8.3 (CI)
+      - name: Setup PHP 8.3 for build
         uses: shivammathur/setup-php@v2
         with:
           php-version: '8.3'
@@ -42,7 +58,7 @@ jobs:
       - name: Composer install (no-dev)
         run: composer install --no-interaction --prefer-dist --no-progress --no-dev
 
-      - name: Archive project
+      - name: Pack release
         run: |
           tar \
             --exclude=".git" \
@@ -53,96 +69,63 @@ jobs:
             --exclude="storage/framework/views/*" \
             -czf release.tar.gz .
 
-      # ⬇️ FIX: ใช้ v4.1.7 แทน v5 ที่มีปัญหา
-      - name: Upload to server
-        uses: easingthemes/ssh-deploy@v4.1.7
-        env:
-          SSH_PRIVATE_KEY: ${{ secrets.SSH_KEY }}
-          REMOTE_HOST: ${{ secrets.SSH_HOST }}
-          REMOTE_USER: ${{ secrets.SSH_USER }}
-          REMOTE_PORT: ${{ secrets.SSH_PORT }}
-          TARGET: ${{ secrets.DEPLOY_PATH }}
-          ARGS: "-az"
-          SOURCE: "release.tar.gz"
-
-      - name: Backup + Deploy with PHP 8.3
-        uses: appleboy/ssh-action@v1.2.0
+      - name: Add SSH key to agent
+        uses: webfactory/ssh-agent@v0.8.0
         with:
-          host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USER }}
-          port: ${{ secrets.SSH_PORT }}
-          key: ${{ secrets.SSH_KEY }}
-          script: |
-            set -e
-            cd "${{ secrets.DEPLOY_PATH }}"
+          ssh-private-key: ${{ secrets.SSH_KEY }}
 
-            PHP_BIN="/usr/local/php83/bin/php"
-            COMPOSER_BIN="${{ secrets.COMPOSER_BIN }}"
-            [ -z "$COMPOSER_BIN" ] && COMPOSER_BIN="/usr/local/bin/composer"
+      - name: Trust host key
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -p "$SSH_PORT" "$SSH_HOST" >> ~/.ssh/known_hosts
 
-            RELEASE_TGZ="release.tar.gz"
-            BACKUP_DIR="backups"
-            TMP_DIR="deploy_tmp"
-            TS="$(date +%Y%m%d-%H%M%S)"
-            KEEP_BACKUPS=5
+      - name: Upload release (scp)
+        run: |
+          scp -P "$SSH_PORT" -o StrictHostKeyChecking=no release.tar.gz "$SSH_USER@$SSH_HOST:$DEPLOY_PATH/"
 
-            echo "==> Using $PHP_BIN"; $PHP_BIN -v
-            echo "==> Composer:"; $PHP_BIN "$COMPOSER_BIN" -V || true
-
-            mkdir -p "$BACKUP_DIR" "$TMP_DIR"
-
-            echo "==> Create backup: $BACKUP_DIR/$TS.tar.gz"
-            tar \
-              --exclude="./$BACKUP_DIR" \
-              --exclude="./$TMP_DIR" \
-              --exclude="./$RELEASE_TGZ" \
-              --exclude="./storage" \
-              --exclude="./.env" \
-              --exclude="./node_modules" \
-              --exclude="./vendor" \
-              --exclude="./.git" \
-              --exclude="./.github" \
-              -czf "$BACKUP_DIR/$TS.tar.gz" .
-
-            echo "==> Unpack new release to $TMP_DIR"
-            tar -xzf "$RELEASE_TGZ" -C "$TMP_DIR"
-
-            echo "==> Sync into project (delete extras)"
-            rsync -a --delete \
-              --exclude "storage" \
-              --exclude ".env" \
-              --exclude "$BACKUP_DIR" \
-              --exclude "$TMP_DIR" \
-              --exclude "$RELEASE_TGZ" \
-              --exclude ".git" \
-              --exclude ".github" \
-              "$TMP_DIR"/ ./
-
-            rm -rf "$TMP_DIR" "$RELEASE_TGZ"
-
-            chgrp -R www-data storage bootstrap/cache || true
-            chmod -R 775 storage bootstrap/cache || true
-
-            $PHP_BIN "$COMPOSER_BIN" install --no-interaction --prefer-dist --no-dev
-
-            if ! grep -qE '^APP_KEY=base64:' .env 2>/dev/null; then
-              $PHP_BIN artisan key:generate
-            fi
-
-            $PHP_BIN artisan migrate --force
-
-            $PHP_BIN artisan optimize:clear
-            $PHP_BIN artisan config:cache
-            $PHP_BIN artisan route:cache
-            $PHP_BIN artisan view:cache
-            $PHP_BIN artisan queue:restart || true
-            $PHP_BIN artisan horizon:terminate || true
-
-            chown -R admin:www-data . || true
-            find storage -type d -exec chmod 775 {} \; || true
-            find storage -type f -exec chmod 664 {} \; || true
-
-            echo "==> Prune old backups (keep $KEEP_BACKUPS)"
-            ls -1t "$BACKUP_DIR"/*.tar.gz 2>/dev/null | tail -n +$((KEEP_BACKUPS+1)) | xargs -r rm -f
-
-            echo "==> Deploy finished ✔"
+      - name: Backup + Deploy remotely (ssh)
+        shell: bash
+        run: |
+          set -e
+          ssh -p "$SSH_PORT" -o StrictHostKeyChecking=no "$SSH_USER@$SSH_HOST" "\
+            set -e; \
+            cd '$DEPLOY_PATH'; \
+            COMPOSER_BIN='${{ secrets.COMPOSER_BIN }}'; \
+            if [ -z \"\$COMPOSER_BIN\" ]; then COMPOSER_BIN='$DEFAULT_COMPOSER_BIN'; fi; \
+            RELEASE_TGZ='release.tar.gz'; \
+            BACKUP_DIR='backups'; \
+            TMP_DIR='deploy_tmp'; \
+            TS=\$(date +%Y%m%d-%H%M%S); \
+            KEEP_BACKUPS=5; \
+            echo '==> Using '$PHP_BIN; $PHP_BIN -v; echo 'Composer:'; $PHP_BIN \$COMPOSER_BIN -V || true; \
+            mkdir -p \"\$BACKUP_DIR\" \"\$TMP_DIR\"; \
+            echo '==> Create backup: '\$BACKUP_DIR/\$TS.tar.gz; \
+            tar --exclude=\"./\$BACKUP_DIR\" --exclude=\"./\$TMP_DIR\" --exclude=\"./\$RELEASE_TGZ\" \
+                --exclude=\"./storage\" --exclude=\"./.env\" --exclude=\"./node_modules\" \
+                --exclude=\"./vendor\" --exclude=\"./.git\" --exclude=\"./.github\" \
+                -czf \"\$BACKUP_DIR/\$TS.tar.gz\" .; \
+            echo '==> Unpack new release to temp'; \
+            tar -xzf \"\$RELEASE_TGZ\" -C \"\$TMP_DIR\"; \
+            echo '==> Sync into project (delete extras)'; \
+            rsync -a --delete --exclude 'storage' --exclude '.env' --exclude \"\$BACKUP_DIR\" \
+                  --exclude \"\$TMP_DIR\" --exclude \"\$RELEASE_TGZ\" --exclude '.git' --exclude '.github' \
+                  \"\$TMP_DIR\"/ ./; \
+            rm -rf \"\$TMP_DIR\" \"\$RELEASE_TGZ\"; \
+            chgrp -R www-data storage bootstrap/cache || true; \
+            chmod -R 775 storage bootstrap/cache || true; \
+            $PHP_BIN \$COMPOSER_BIN install --no-interaction --prefer-dist --no-dev; \
+            if ! grep -qE '^APP_KEY=base64:' .env 2>/dev/null; then $PHP_BIN artisan key:generate; fi; \
+            $PHP_BIN artisan migrate --force; \
+            $PHP_BIN artisan optimize:clear; \
+            $PHP_BIN artisan config:cache; \
+            $PHP_BIN artisan route:cache; \
+            $PHP_BIN artisan view:cache; \
+            $PHP_BIN artisan queue:restart || true; \
+            $PHP_BIN artisan horizon:terminate || true; \
+            chown -R admin:www-data . || true; \
+            find storage -type d -exec chmod 775 {} \; || true; \
+            find storage -type f -exec chmod 664 {} \; || true; \
+            echo '==> Prune old backups (keep '\$KEEP_BACKUPS')'; \
+            ls -1t \"\$BACKUP_DIR\"/*.tar.gz 2>/dev/null | tail -n +\$((KEEP_BACKUPS+1)) | xargs -r rm -f; \
+            echo '==> Deploy finished ✔' \
+          "
