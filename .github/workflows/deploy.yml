@@ -1,0 +1,148 @@
+name: Build & Deploy (trade.xman4289.com)
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch: {}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Build ฝั่ง CI ด้วย PHP 8.3
+      - name: Setup PHP 8.3
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: mbstring, intl, pdo_mysql, gd, bcmath, curl
+          coverage: none
+
+      - name: Show versions
+        run: |
+          php -v
+          composer -V || true
+
+      # ติดตั้ง deps (ไม่เอา dev) เพื่อจับปัญหา dependency ตั้งแต่ใน CI
+      - name: Install Composer deps (no-dev)
+        run: composer install --no-interaction --prefer-dist --no-progress --no-dev
+
+      # (ถ้ามี frontend) ปลดคอมเมนต์สองบล็อกด้านล่าง
+      # - name: Use Node 20
+      #   uses: actions/setup-node@v4
+      #   with:
+      #     node-version: '20'
+      # - name: Build assets
+      #   run: |
+      #     npm ci
+      #     npm run build
+
+      # แพ็กโค้ด (ตัดไฟล์ที่ไม่จำเป็น)
+      - name: Archive project
+        run: |
+          tar \
+            --exclude=".git" \
+            --exclude=".github" \
+            --exclude="node_modules" \
+            --exclude="storage/logs/*" \
+            --exclude="storage/framework/cache/*" \
+            --exclude="storage/framework/views/*" \
+            -czf release.tar.gz .
+
+      # อัปโหลดแพ็กไปยังเซิร์ฟเวอร์
+      - name: Upload to server
+        uses: easingthemes/ssh-deploy@v5
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_KEY }}
+          REMOTE_HOST: ${{ secrets.SSH_HOST }}
+          REMOTE_USER: ${{ secrets.SSH_USER }}
+          REMOTE_PORT: ${{ secrets.SSH_PORT }}
+          TARGET: ${{ secrets.DEPLOY_PATH }}
+          ARGS: "-az"
+          SOURCE: "release.tar.gz"
+
+      # สำรอง (backup) + ดีพลอย + เคลียร์แคช บนเครื่องปลายทาง (บังคับ PHP 8.3)
+      - name: Remote deploy steps (backup + deploy with PHP 8.3)
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          port: ${{ secrets.SSH_PORT }}
+          key: ${{ secrets.SSH_KEY }}
+          script: |
+            set -e
+            cd "${{ secrets.DEPLOY_PATH }}"
+
+            PHP_BIN="/usr/local/php83/bin/php"
+            COMPOSER_BIN="${{ secrets.COMPOSER_BIN }}"
+            [ -z "$COMPOSER_BIN" ] && COMPOSER_BIN="/usr/local/bin/composer"
+
+            RELEASE_TGZ="release.tar.gz"
+            BACKUP_DIR="backups"
+            TMP_DIR="deploy_tmp"
+            TS="$(date +%Y%m%d-%H%M%S)"
+            KEEP_BACKUPS=5
+
+            echo "==> Using $PHP_BIN"; $PHP_BIN -v
+            echo "==> Composer:"; $PHP_BIN "$COMPOSER_BIN" -V || true
+
+            mkdir -p "$BACKUP_DIR" "$TMP_DIR"
+
+            echo "==> Creating backup: $BACKUP_DIR/$TS.tar.gz"
+            tar \
+              --exclude="./$BACKUP_DIR" \
+              --exclude="./$TMP_DIR" \
+              --exclude="./$RELEASE_TGZ" \
+              --exclude="./storage" \
+              --exclude="./.env" \
+              --exclude="./node_modules" \
+              --exclude="./vendor" \
+              --exclude="./.git" \
+              --exclude="./.github" \
+              -czf "$BACKUP_DIR/$TS.tar.gz" .
+
+            echo "==> Unpack new release to $TMP_DIR"
+            tar -xzf "$RELEASE_TGZ" -C "$TMP_DIR"
+
+            echo "==> Sync new release into project root (delete extras)"
+            rsync -a --delete \
+              --exclude "storage" \
+              --exclude ".env" \
+              --exclude "$BACKUP_DIR" \
+              --exclude "$TMP_DIR" \
+              --exclude "$RELEASE_TGZ" \
+              --exclude ".git" \
+              --exclude ".github" \
+              "$TMP_DIR"/ ./
+
+            rm -rf "$TMP_DIR" "$RELEASE_TGZ"
+
+            chgrp -R www-data storage bootstrap/cache || true
+            chmod -R 775 storage bootstrap/cache || true
+
+            $PHP_BIN "$COMPOSER_BIN" install --no-interaction --prefer-dist --no-dev
+
+            if ! grep -qE '^APP_KEY=base64:' .env 2>/dev/null; then
+              $PHP_BIN artisan key:generate
+            fi
+
+            $PHP_BIN artisan migrate --force
+
+            $PHP_BIN artisan optimize:clear
+            $PHP_BIN artisan config:cache
+            $PHP_BIN artisan route:cache
+            $PHP_BIN artisan view:cache
+            $PHP_BIN artisan queue:restart || true
+            $PHP_BIN artisan horizon:terminate || true
+
+            chown -R admin:www-data . || true
+            find storage -type d -exec chmod 775 {} \; || true
+            find storage -type f -exec chmod 664 {} \; || true
+
+            echo "==> Prune old backups, keep last $KEEP_BACKUPS"
+            ls -1t "$BACKUP_DIR"/*.tar.gz 2>/dev/null | tail -n +$((KEEP_BACKUPS+1)) | xargs -r rm -f
+
+            echo "==> Deploy finished ✔"
