@@ -32,7 +32,7 @@ jobs:
         run: |
           set -e
           echo ">> Try SSH to $SSH_USER@$SSH_HOST:$SSH_PORT"
-          ssh -vv -p "$SSH_PORT" -o StrictHostKeyChecking=no "$SSH_USER@$SSH_HOST" "\
+          ssh -p "$SSH_PORT" -o StrictHostKeyChecking=no "$SSH_USER@$SSH_HOST" "\
             echo '✅ Connected to' \$(hostname); \
             whoami; \
             $PHP_BIN -v; \
@@ -58,16 +58,11 @@ jobs:
       - name: Composer install (no-dev)
         run: composer install --no-interaction --prefer-dist --no-progress --no-dev
 
-      - name: Pack release
+      # ⬇️ ใช้ git archive เพื่อเลี่ยงปัญหา "file changed as we read it"
+      - name: Pack release (git archive, safest)
         run: |
-          tar \
-            --exclude=".git" \
-            --exclude=".github" \
-            --exclude="node_modules" \
-            --exclude="storage/logs/*" \
-            --exclude="storage/framework/cache/*" \
-            --exclude="storage/framework/views/*" \
-            -czf release.tar.gz .
+          git archive --format=tar HEAD | gzip -9 > release.tar.gz
+          ls -lh release.tar.gz
 
       - name: Add SSH key to agent
         uses: webfactory/ssh-agent@v0.8.0
